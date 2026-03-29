@@ -30,6 +30,11 @@ def _retcode_name(code: int) -> str:
     return str(code)
 
 
+def _env_truthy(key: str) -> bool:
+    v = os.environ.get(key, "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 @dataclass
 class ConnectConfig:
     """Credentials from env or explicit values (never commit real passwords)."""
@@ -38,6 +43,7 @@ class ConnectConfig:
     password: Optional[str] = None
     server: Optional[str] = None
     terminal_path: Optional[str] = None
+    use_existing_session: bool = False
 
     @classmethod
     def from_env(cls) -> "ConnectConfig":
@@ -48,13 +54,22 @@ class ConnectConfig:
         login: Optional[int] = None
         if login_raw.isdigit():
             login = int(login_raw)
-        return cls(login=login, password=password, server=server, terminal_path=path)
+        return cls(
+            login=login,
+            password=password,
+            server=server,
+            terminal_path=path,
+            use_existing_session=_env_truthy("MT5_USE_EXISTING_SESSION"),
+        )
 
 
 def connect(cfg: Optional[ConnectConfig] = None) -> bool:
     """
     Initialize MT5 and optionally log in.
-    If login/password/server are set, uses them; else uses logged-in terminal session.
+    If login/password/server are set and use_existing_session is False, calls mt5.login;
+    otherwise uses the account already active in the terminal (after manual sign-in).
+    Set MT5_USE_EXISTING_SESSION=1 in the environment to skip mt5.login while keeping
+    credentials in .env for reference.
     """
     cfg = cfg or ConnectConfig.from_env()
     kwargs: Dict[str, Any] = {}
@@ -95,18 +110,31 @@ def connect(cfg: Optional[ConnectConfig] = None) -> bool:
 
     log_line("MT5 initialized.")
 
-    if cfg.login and cfg.password and cfg.server:
+    want_api_login = (
+        bool(cfg.login and cfg.password and cfg.server) and not cfg.use_existing_session
+    )
+    if want_api_login:
         if not mt5.login(cfg.login, password=cfg.password, server=cfg.server):
             log_line(f"login() failed: {mt5.last_error()}")
             mt5.shutdown()
             return False
         log_line(f"Logged in to server {cfg.server!r} as {cfg.login}.")
     else:
+        if cfg.use_existing_session and cfg.login and cfg.password and cfg.server:
+            log_line(
+                "Using existing terminal session (MT5_USE_EXISTING_SESSION set; skipping mt5.login)."
+            )
         ti = mt5.terminal_info()
         if ti:
             log_line(f"Using existing terminal session: {ti.name!r} connected={ti.connected}")
         else:
             log_line("Warning: terminal_info() unavailable.")
+        if cfg.use_existing_session and cfg.login:
+            ai = mt5.account_info()
+            if ai and ai.login != cfg.login:
+                log_line(
+                    f"Warning: terminal login={ai.login} but MT5_LOGIN in env is {cfg.login}."
+                )
 
     return True
 
@@ -140,9 +168,12 @@ def get_filling_mode(symbol: str) -> int:
     if not info:
         return mt5.ORDER_FILLING_IOC
     mode = info.filling_mode
-    if mode & mt5.SYMBOL_FILLING_FOK:
+    # symbol_info().filling_mode is an MQL5 bitmask; older MetaTrader5 wheels omit SYMBOL_FILLING_*.
+    fok_flag = getattr(mt5, "SYMBOL_FILLING_FOK", 1)
+    ioc_flag = getattr(mt5, "SYMBOL_FILLING_IOC", 2)
+    if mode & fok_flag:
         return mt5.ORDER_FILLING_FOK
-    if mode & mt5.SYMBOL_FILLING_IOC:
+    if mode & ioc_flag:
         return mt5.ORDER_FILLING_IOC
     return mt5.ORDER_FILLING_RETURN
 
@@ -274,6 +305,18 @@ def place_market_order(
     if tp_adj is not None:
         request["tp"] = tp_adj
 
+    chk = mt5.order_check(request)
+    if chk is not None and chk.retcode == mt5.TRADE_RETCODE_MARKET_CLOSED:
+        log_line(
+            f"order_check: market closed for {symbol!r} (retcode={chk.retcode}) — order not sent."
+        )
+        log_line(
+            "Hint (MARKET_CLOSED): No new deals for this symbol right now — typical on weekends "
+            "or outside the broker’s session. Retry during live FX hours (Mon–Fri, session "
+            "depends on symbol/broker), or use a symbol that is open on your demo server."
+        )
+        return False, chk
+
     log_line(
         f"Sending MARKET {side_l.upper()} {symbol} vol={vol} price={price} "
         f"sl={sl_adj} tp={tp_adj} filling={filling} deviation={deviation}"
@@ -289,6 +332,12 @@ def place_market_order(
             f"order_send failed: retcode={result.retcode} ({_retcode_name(result.retcode)}) "
             f"comment={getattr(result, 'comment', '')!r} last_error={mt5.last_error()}"
         )
+        if result.retcode == mt5.TRADE_RETCODE_MARKET_CLOSED:
+            log_line(
+                "Hint (MARKET_CLOSED): No new deals for this symbol right now — typical on weekends "
+                "or outside the broker’s session. Retry during live FX hours (Mon–Fri, session "
+                "depends on symbol/broker), or use a symbol that is open on your demo server."
+            )
         return False, result
 
     log_line(
@@ -303,26 +352,73 @@ def modify_position_sltp(
     symbol: str,
     sl: Optional[float],
     tp: Optional[float],
+    *,
+    adjust: bool = True,
 ) -> bool:
-    """Modify SL/TP on an open position."""
+    """
+    Modify SL/TP on an open position.
+    Pass sl=None or tp=None to keep the current value on that side (read from the position).
+    When adjust=True, SL/TP are clamped to symbol stop level vs current bid/ask (same rules as open).
+    """
+    pos_tuple = mt5.positions_get(ticket=position_ticket)
+    if not pos_tuple:
+        log_line(
+            f"modify SLTP: no position for ticket={position_ticket}: {mt5.last_error()}"
+        )
+        return False
+    pos = pos_tuple[0]
+    if pos.symbol != symbol:
+        log_line(
+            f"modify SLTP: ticket {position_ticket} is {pos.symbol!r}, expected {symbol!r}"
+        )
+        return False
+
+    sl_eff = pos.sl if sl is None else float(sl)
+    tp_eff = pos.tp if tp is None else float(tp)
+    sl_o: Optional[float] = None if sl_eff == 0.0 else float(sl_eff)
+    tp_o: Optional[float] = None if tp_eff == 0.0 else float(tp_eff)
+
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick:
+        log_line(f"modify SLTP: no tick for {symbol}: {mt5.last_error()}")
+        return False
+    order_type = (
+        mt5.ORDER_TYPE_BUY if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_SELL
+    )
+    ref = tick.bid if pos.type == mt5.POSITION_TYPE_BUY else tick.ask
+
+    if adjust:
+        sl_a, tp_a, notes = adjust_stops(symbol, order_type, ref, sl_o, tp_o)
+        for n in notes:
+            log_line(n)
+    else:
+        sl_a, tp_a = sl_o, tp_o
+
+    req_sl = 0.0 if sl_a is None else float(sl_a)
+    req_tp = 0.0 if tp_a is None else float(tp_a)
+
     request = {
         "action": mt5.TRADE_ACTION_SLTP,
         "position": position_ticket,
         "symbol": symbol,
-        "sl": sl if sl is not None else 0.0,
-        "tp": tp if tp is not None else 0.0,
+        "sl": req_sl,
+        "tp": req_tp,
     }
-    log_line(f"Modifying SLTP position={position_ticket} {symbol} sl={sl} tp={tp}")
+    log_line(
+        f"Modifying SLTP position={position_ticket} {symbol} sl={req_sl} tp={req_tp} "
+        f"(ref_price={ref})"
+    )
     result = mt5.order_send(request)
     if result is None:
         log_line(f"modify SLTP None: {mt5.last_error()}")
         return False
     if result.retcode != mt5.TRADE_RETCODE_DONE:
         log_line(
-            f"modify SLTP failed: {_retcode_name(result.retcode)} {mt5.last_error()}"
+            f"modify SLTP failed: {_retcode_name(result.retcode)} {mt5.last_error()} "
+            f"comment={getattr(result, 'comment', '')!r}"
         )
         return False
-    log_line("SL/TP updated.")
+    log_line("SL/TP modify completed (TRADE_RETCODE_DONE).")
     return True
 
 
