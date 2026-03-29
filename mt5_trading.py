@@ -79,6 +79,18 @@ def connect(cfg: Optional[ConnectConfig] = None) -> bool:
             log_line(
                 "Also use 64-bit Python: py -c \"import struct; print(struct.calcsize('P')*8)\"  → should print 64."
             )
+        elif code == -6 or (
+            isinstance(err, tuple)
+            and len(err) > 1
+            and isinstance(err[1], str)
+            and "authorization" in err[1].lower()
+        ):
+            log_line(
+                "Hint (-6): Terminal rejected the Python API. In MT5: Tools → Options → Expert Advisors → "
+                "enable 'Allow algorithmic trading'. Keep this terminal window open and logged in; "
+                "if MT5_TERMINAL_PATH is set, it must be that install's terminal64.exe. "
+                "Run Python and MT5 both as normal user or both as admin (mixed elevation can block IPC)."
+            )
         return False
 
     log_line("MT5 initialized.")
